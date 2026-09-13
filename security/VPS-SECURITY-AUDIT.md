@@ -681,10 +681,23 @@ php -i 2>/dev/null | grep -E 'disable_functions|allow_url_fopen|allow_url_includ
 # Tìm cài đặt WordPress
 find / -name 'wp-config.php' -not -path '/proc/*' 2>/dev/null
 
-# Version core, plugin, theme
-wp core version --allow-root --path=/var/www/html 2>/dev/null
-wp plugin list --allow-root --path=/var/www/html 2>/dev/null
-wp theme list --allow-root --path=/var/www/html 2>/dev/null
+# Version core + plugin — ĐỌC THUẦN TỪ DISK.
+# TUYỆT ĐỐI KHÔNG dùng `wp plugin list --allow-root` trên máy production:
+# lệnh đó nạp WordPress, mở kết nối tới database, chạy code của MỌI plugin đang
+# active bằng quyền root, gọi ra api.wordpress.org, và GHI transient update_plugins
+# vào database. Nó vi phạm read-only, và nếu site đã dính webshell trong mu-plugin
+# thì nó trao luôn quyền root cho webshell đó.
+WP=/var/www/html
+sed -n "s/.*wp_version *= *'\([^']*\)'.*/core: \1/p" "$WP/wp-includes/version.php" | head -1
+for pl in "$WP"/wp-content/plugins/*/; do
+  for f in "$pl"*.php; do
+    [ -f "$f" ] || continue
+    head -c 8192 "$f" | grep -qiE '^[[:space:]]*\*?[[:space:]]*Plugin Name:' || continue
+    echo "$(basename "$pl") $(head -c 8192 "$f" | grep -m1 -oiE 'Version:[[:space:]]*[0-9][^[:space:]]*' | grep -oE '[0-9][^[:space:]]*')"
+    break
+  done
+done
+ls -la "$WP"/wp-content/mu-plugins/ 2>/dev/null   # mu-plugin LUÔN chạy, không tắt được
 
 # Quyền wp-config.php — chứa credential DB
 stat -c '%n %a %U:%G' $(find / -name wp-config.php -not -path '/proc/*' 2>/dev/null)
@@ -873,9 +886,11 @@ done 2>/dev/null
 find / -name 'id_rsa' -o -name 'id_ed25519' -o -name '*.pem' -o -name '*.key' \
   -not -path '/proc/*' 2>/dev/null | while read f; do stat -c '%n %a %U' "$f"; done
 
-# History chứa credential
-grep -iE 'mysql -p|psql.*password|curl.*-u |export.*TOKEN|ssh-keygen.*-N ' \
-  /root/.bash_history /home/*/.bash_history 2>/dev/null | head -20
+# History chứa credential — CHỈ ĐẾM, KHÔNG IN NỘI DUNG DÒNG
+# (v1 của tài liệu này in thẳng ra, tức là tạo một danh sách mọi mật khẩu từng gõ)
+grep -HicE 'mysql.*[[:space:]]-p[^[:space:]]|psql.*password|curl.*[[:space:]]-u[[:space:]]|export[[:space:]].*(TOKEN|SECRET|PASSW|API.?KEY)=|ssh-keygen.*[[:space:]]-N[[:space:]]' \
+  /root/.bash_history /home/*/.bash_history 2>/dev/null | grep -v ':0$' \
+  || echo "không phát hiện credential trong bash_history"
 ```
 
 **Cờ đỏ:**
@@ -968,7 +983,7 @@ sysctl -a 2>/dev/null | grep -E 'kernel.kptr_restrict|kernel.dmesg_restrict|kern
 | CVE-2021-3156 | Baron Samedit | sudo < 1.9.5p2 | Heap overflow |
 | CVE-2022-0847 | Dirty Pipe | kernel 5.8 – 5.16.11 | Ghi đè file read-only |
 | CVE-2023-4911 | Looney Tunables | glibc ld.so 2.34+ | Buffer overflow trong `GLIBC_TUNABLES` |
-| CVE-2024-1086 | nf_tables UAF | kernel 3.15 – 6.1.x | Exploit công khai, tin cậy cao |
+| CVE-2024-1086 | nf_tables UAF | kernel 3.15 → 6.7 (vá ở 6.7.x/6.6.x/6.1.x/5.15.x tuỳ nhánh) | Exploit công khai, tin cậy cao. Dải ở v1 ghi "3.15–6.1.x" là SAI — nó khiến kernel 6.2–6.7 đang dính bị đọc thành an toàn |
 | CVE-2022-2588 | route4 UAF | kernel < 5.19 | |
 | CVE-2021-22555 | Netfilter heap OOB | kernel 2.6.19+ | |
 
@@ -1209,6 +1224,62 @@ ss -ulnp | grep 631
 systemctl is-active cups-browsed 2>/dev/null
 ```
 
+> ### ⛔ TRƯỚC KHI DÙNG BẢNG NÀY — ĐỌC PHẦN NÀY
+>
+> **Chuỗi version KHÔNG cho biết đã vá hay chưa.** Trên Debian/Ubuntu/RHEL, distro
+> backport bản vá bảo mật vào version cũ mà **không đổi số version upstream**.
+>
+> Ví dụ đo thật trên một máy Ubuntu 24.04:
+> - `openssl version` → `3.0.13` (bản upstream tháng 01/2024, trông rất cũ)
+> - package thật → `3.0.13-0ubuntu3.7`
+> - `apt-get changelog openssl` → đã vá CVE-2025-15467, CVE-2025-68160, CVE-2025-69418
+>
+> Nghĩa là mọi lệnh kiểu `ssh -V`, `php -v`, `openssl version` trong tài liệu này
+> chỉ dùng để **nhận diện thành phần**, tuyệt đối không dùng để kết luận tình trạng vá.
+> Dùng nó làm kết luận sẽ tạo ra một danh sách báo động giả dài dằng dặc, và điều tệ
+> hơn là nó làm mất niềm tin vào toàn bộ bản audit.
+>
+> **Cách kiểm tra đúng cho một CVE cụ thể:**
+>
+> ```bash
+> # Ubuntu — câu trả lời chính thức cho đúng release của mình
+> pro fix --dry-run CVE-2024-6387
+> curl -s https://ubuntu.com/security/cves/CVE-2024-6387.json | \
+>   grep -B2 -A3 "$(. /etc/os-release; echo $VERSION_CODENAME)"
+>
+> # Debian
+> curl -s https://security-tracker.debian.org/tracker/CVE-2024-6387 | sed 's/<[^>]*>/ /g' | grep -iE 'bookworm|fixed|vulnerable'
+>
+> # RHEL/Alma/Rocky
+> dnf updateinfo info --cve CVE-2024-6387
+> rpm -q --changelog openssh-server | grep -i CVE-2024-6387   # chạy offline được
+>
+> # Toàn máy, cách nhanh nhất và đủ dùng cho 90% trường hợp:
+> apt list --upgradable 2>/dev/null | grep -i security
+> dnf updateinfo list --security
+> ```
+>
+> **Cảnh báo về `dnf updateinfo`:** nó chỉ đúng khi repo có errata metadata.
+> RHEL/Alma/Rocky/Oracle có; CentOS Stream và phần lớn repo bên thứ ba **không có**.
+> Output rỗng ở đó nghĩa là **KHÔNG XÁC ĐỊNH**, không phải "sạch".
+>
+> **Cảnh báo về `/usr/share/doc`:** trên Ubuntu 24.04+, changelog của nhiều gói là
+> symlink hỏng do đợt đổi tên `t64`. Grep file đó sẽ ra rỗng và bị hiểu nhầm là
+> "không dính CVE". Luôn dùng `apt-get changelog <gói>`.
+>
+> **Vá rồi vẫn chưa an toàn nếu chưa restart.** Tiến trình đang chạy vẫn nạp thư
+> viện cũ trong bộ nhớ cho tới khi restart:
+> ```bash
+> needrestart -b -r l              # Debian/Ubuntu
+> needs-restarting -r ; echo $?    # RHEL (1 = cần reboot)
+> for p in /proc/[0-9]*; do grep -qE '/(usr|lib)/.*\(deleted\)' $p/maps 2>/dev/null && echo "$p $(cat $p/comm)"; done
+> cat /var/run/reboot-required 2>/dev/null
+> ```
+>
+> **Điểm mù còn lại:** không có tracker nào thấy phần mềm build từ source, binary
+> tĩnh Go/Rust, hay thư viện cài qua pip/npm/composer. Nhóm đó cần quét SBOM riêng
+> (`trivy rootfs --scanners vuln /`, hoặc `syft` + `grype`).
+
 **Bảng đối chiếu:**
 
 | CVE | Thành phần | Bản dính | Tác động |
@@ -1218,13 +1289,13 @@ systemctl is-active cups-browsed 2>/dev/null
 | CVE-2023-48795 | SSH (Terrapin) | < OpenSSH 9.6 | Hạ cấp kênh bảo mật |
 | CVE-2021-4034 | polkit pkexec | trước 2022-01 | Leo thang root cục bộ |
 | CVE-2021-3156 | sudo | < 1.9.5p2 | Leo thang root cục bộ |
-| CVE-2023-4911 | glibc | ld.so 2.34+ | Leo thang root cục bộ |
-| CVE-2024-1086 | kernel nf_tables | 3.15–6.1.x | Leo thang root cục bộ |
+| CVE-2023-4911 | glibc ld.so | 2.34 → 2.38 (vá trong 2.38) | Leo thang root cục bộ. Ghi "2.34+" là vô dụng — nó khớp vĩnh viễn mọi hệ thống hiện đại |
+| CVE-2024-1086 | kernel nf_tables | 3.15 → 6.7 | Leo thang root cục bộ |
 | CVE-2024-21626 | runc | < 1.1.12 | Container escape |
 | CVE-2024-47176 | cups-browsed | < 2.0.1 | RCE qua UDP 631 |
 | CVE-2023-44487 | HTTP/2 | mọi impl trước bản vá | Rapid Reset DDoS |
 | CVE-2021-44228 | Log4j | 2.0–2.14.1 | RCE (nếu có Java) |
-| CVE-2025-32433 | Erlang/OTP SSH | < 25.3.2.10 / 26.2.4 / 27.3.3 | RCE không cần auth (nếu có RabbitMQ/Elixir) |
+| CVE-2025-32433 | Erlang/OTP SSH daemon | < 25.3.2.20 / 26.2.5.11 / 27.3.3 | RCE không cần auth. **Chỉ ảnh hưởng Erlang SSH daemon**, không phải RabbitMQ nói chung — RabbitMQ chỉ dính nếu bật SSH shell của Erlang |
 | CVE-2025-29927 | Next.js middleware | 11.1.4–15.2.2 | Bypass xác thực middleware |
 
 > **Lưu ý về thời điểm:** Bảng này dừng ở dữ liệu tao nắm được. Với CVE công bố sau đó, phải đối chiếu trực tiếp tại `https://ubuntu.com/security/cves` (hoặc trang tương ứng của distro), `https://nvd.nist.gov/`, và CISA KEV catalog `https://www.cisa.gov/known-exploited-vulnerabilities-catalog`. **Đừng tin bảng tĩnh cho việc audit thực tế** — luôn chạy `apt list --upgradable | grep security` để lấy trạng thái thật của máy.
@@ -1470,6 +1541,222 @@ canonical-livepatch status 2>/dev/null
 
 ---
 
+## TIER 10 — RỦI RO ĐẶC THÙ CỦA VPS AGENCY (nhiều client trên một máy)
+
+> Tier này được bổ sung ở v2. Nó là nhóm rủi ro lớn nhất với mô hình agency mà bản
+> v1 hoàn toàn không mô hình hoá.
+
+### T10-01 — Bán kính thiệt hại khi một site bị chiếm
+
+**Cơ chế:** Nếu 20 site client cùng chạy dưới user `www-data`, thì một plugin
+WordPress thủng ở site A cho attacker quyền đọc/ghi vào webroot của **cả 19 site
+còn lại** — không cần leo thang đặc quyền gì hết. Đọc được `wp-config.php` của mọi
+site nghĩa là có credential database của mọi site. Đây là con đường từ "một plugin
+lỗi" đến "mất toàn bộ danh mục khách hàng", và nó là mặc định của hầu hết cấu hình
+LEMP/LAMP dựng nhanh.
+
+**Mức:** CRITICAL với mô hình agency
+
+**Lệnh check:**
+```bash
+# Mỗi site chạy user nào — nếu cột user giống nhau hết là KHÔNG có cách ly
+grep -rhE '^\s*(\[|user|group|listen)\s*=?' /etc/php/*/fpm/pool.d/*.conf /etc/php-fpm.d/*.conf 2>/dev/null
+
+# Chủ sở hữu từng webroot
+for d in /var/www/* /home/*/public_html; do
+  [ -d "$d" ] && printf '%s  %s\n' "$(stat -c '%U:%G %a' "$d")" "$d"
+done
+
+# open_basedir có giới hạn mỗi site trong thư mục của nó không
+grep -rh 'open_basedir' /etc/php/*/fpm/pool.d/*.conf /etc/php/*/fpm/php.ini 2>/dev/null
+
+# Thử nghiệm thật: từ site A có đọc được wp-config của site B không
+sudo -u www-data cat /var/www/site-B/wp-config.php >/dev/null 2>&1 && echo "ĐỌC ĐƯỢC — không có cách ly"
+```
+
+**Cờ đỏ:**
+- Mọi pool PHP-FPM chạy chung một `user`
+- Không có `open_basedir` giới hạn theo site
+- Webroot của các client khác nhau cùng owner
+- Một user có thể `cat` wp-config của site khác
+
+**Khắc phục:** Mỗi site một system user, một PHP-FPM pool, `open_basedir` khoá vào
+webroot của chính nó. Tốn công dựng lại nhưng đây là thay đổi có giá trị cao nhất
+trong toàn bộ danh sách này đối với mô hình agency.
+
+---
+
+### T10-02 — Phần mềm panel quản trị
+
+**Cơ chế:** cPanel/WHM, Plesk, CyberPanel, aaPanel, DirectAdmin, Webmin, phpMyAdmin
+và plugin LiteSpeed là nhóm bị khai thác hàng loạt nhiều nhất trong 12 tháng gần đây.
+Chúng chạy quyền cao, phơi cổng quản trị ra internet, và có lịch sử CVE pre-auth
+nghiêm trọng lặp đi lặp lại — gồm cả lỗi bypass xác thực trước khi đăng nhập và lỗi
+leo thang từ tenant lên root trên máy shared hosting.
+
+**Mức:** CRITICAL nếu có cài
+
+**Lệnh check:**
+```bash
+for p in /usr/local/cpanel /usr/local/psa /opt/psa /usr/local/CyberCP /www/server/panel \
+         /usr/share/webmin /usr/local/directadmin /usr/local/hestia /usr/local/lsws; do
+  [ -e "$p" ] && echo "PHÁT HIỆN: $p"
+done
+ss -tlnp | grep -E ':(2082|2083|2086|2087|2095|2096|8083|8090|7080|10000|8443)'
+find /var/www /usr/share -maxdepth 4 -type d \( -name 'phpmyadmin' -o -name 'adminer*' \) 2>/dev/null
+```
+
+**Cờ đỏ:**
+- Cổng panel mở ra `0.0.0.0`
+- Panel không bật auto-update
+- phpMyAdmin truy cập được công khai — không bao giờ nên như vậy
+
+**Khắc phục:** Panel là thứ bắt buộc phải vá sớm nhất trên máy. Giới hạn cổng quản
+trị theo IP hoặc chỉ qua VPN. phpMyAdmin: gỡ bỏ, hoặc đặt sau HTTP auth + giới hạn IP.
+
+---
+
+### T10-03 — Kiểm soát luồng ra (egress)
+
+**Cơ chế:** Hầu hết VPS chặn inbound rất kỹ và **không chặn outbound gì cả**. Nhưng
+mọi chuỗi tấn công hiện đại đều cần outbound: tải payload giai đoạn hai, gọi về C2,
+đẩy dữ liệu ra ngoài, kết nối mining pool. Chặn egress là biện pháp có tỉ lệ
+hiệu quả trên công sức cao nhất mà gần như không ai làm.
+
+**Mức:** HIGH
+
+**Lệnh check:**
+```bash
+iptables -S OUTPUT | grep -c '^-A'        # < 2 nghĩa là không lọc gì
+iptables -S | grep '^-P OUTPUT'
+
+# Web server có tự gọi ra internet không (bình thường là không nên)
+ss -tnp state established | grep -E 'nginx|apache|php-fpm'
+```
+
+**Khắc phục:** Default DROP cho OUTPUT, chỉ allow: DNS tới resolver đã định, HTTPS
+tới repo update, SMTP tới relay đã định, và các API mà ứng dụng thực sự cần. Một
+webshell trên máy có egress bị chặn gần như vô dụng.
+
+---
+
+### T10-04 — Backup có sống sót trước attacker có quyền root không
+
+**Cơ chế:** Câu hỏi đúng không phải "có backup không" mà là "attacker cầm root trên
+máy này có xoá được backup không". Các chiến dịch ransomware hiện đại tìm và phá
+hệ thống backup **trước** khi mã hoá, chính xác vì backup là thứ duy nhất khiến nạn
+nhân không phải trả tiền. Credential rclone/borg/restic nằm trên VPS nghĩa là attacker
+có luôn quyền xoá kho backup.
+
+**Mức:** CRITICAL
+
+**Lệnh check:**
+```bash
+ls -la /root/.config/rclone/rclone.conf /root/.borg* /etc/borgmatic* 2>/dev/null
+findmnt -t nfs,nfs4,cifs,fuse.sshfs -o TARGET,SOURCE,FSTYPE
+crontab -l | grep -iE 'backup|borg|restic|rclone'
+```
+
+**Bốn câu phải trả lời được (không lệnh nào trả lời thay):**
+1. Có bản off-site mà credential trên VPS này **không xoá được** không? (object lock,
+   immutable, append-only repo key)
+2. Lần cuối test restore **thật** là khi nào, mất bao lâu?
+3. Backup có mã hoá không, key lưu ở đâu — có nằm trên chính VPS này không?
+4. Nếu VPS bị mã hoá lúc 2h sáng nay, mất tối đa bao nhiêu giờ dữ liệu?
+
+Không trả lời được câu 1 và câu 2 thì coi như chưa có backup.
+
+---
+
+### T10-05 — Mail server bị lạm dụng
+
+**Cơ chế:** VPS bị chiếm rất hay được dùng để gửi spam. Hậu quả với agency là trực
+tiếp và tốn kém: IP vào blacklist, email của **tất cả** client rơi vào spam, domain
+mất reputation. Thiệt hại kinh doanh thường lớn hơn bản thân vụ xâm nhập.
+
+**Mức:** HIGH
+
+**Lệnh check:**
+```bash
+ss -tlnp | grep -E ':(25|465|587)'
+postconf -n | grep -E 'mynetworks|smtpd_relay_restrictions|inet_interfaces'
+mailq | tail -1                      # hàng đợi lớn bất thường = đang gửi spam
+grep -c 'status=sent' /var/log/mail.log
+```
+
+**Cờ đỏ:**
+- `mynetworks` chứa `0.0.0.0/0` → open relay
+- Hàng đợi mail hàng nghìn thư
+- Máy gửi mail trong khi không có ứng dụng nào cần gửi
+
+**Kiểm tra từ ngoài:** https://mxtoolbox.com/blacklists.aspx
+
+---
+
+## TIER 11 — CVE VÀ CHIẾN DỊCH TẤN CÔNG 2026
+
+> Đối chiếu tại thời điểm 09/2026, xác minh qua NVD API và CISA KEV. Bảng này cũng
+> sẽ lỗi thời — nguồn đáng tin là security tracker của distro và CISA KEV.
+
+### T11-01 — CVE đáng chú ý, giai đoạn 05/2026 → 09/2026
+
+| CVE | Thành phần | Dải dính | Ghi chú |
+|---|---|---|---|
+| CVE-2026-60137 + CVE-2026-63030 | **WordPress core** | 6.8.x < 6.8.6, 6.9.x < 6.9.5, 7.0.x < 7.0.2 | SQLi không cần xác thực → chuỗi dẫn tới RCE. **Đang bị khai thác thực tế (KEV)**. Ưu tiên số 1 nếu chạy WP |
+| CVE-2026-31431 | **Linux kernel** (algif_aead) | nhiều nhánh, vá ở 5.10.254 / 5.15.204 / 6.1.170 / 6.6.137 / 6.12.85 / 6.18.22 | Leo thang root cục bộ. **Đang bị khai thác (KEV)** |
+| CVE-2026-53362 | **Linux kernel** (IPv6) | 6.0 → 7.1.2, vá ở 6.1.177 / 6.6.144 / 6.12.95 / 6.18.38 / 7.1.3 | Leo thang root cục bộ. **Đang bị khai thác (KEV)** |
+| CVE-2026-17543 | **PHP ext-pgsql** | 8.2 < 8.2.33, 8.3 < 8.3.33, 8.4 < 8.4.24, 8.5 < 8.5.9 | SQLi 9.8 qua `pg_insert`/`pg_update`. Chỉ khi dùng PostgreSQL |
+| CVE-2026-6722 | **PHP SOAP** | 8.2 < 8.2.31, 8.3 < 8.3.31, 8.4 < 8.4.21, 8.5 < 8.5.6 | UAF → RCE không cần xác thực, nếu có endpoint SOAP |
+| CVE-2026-17544 | **PHP bcmath** | 8.4 < 8.4.24, 8.5 < 8.5.9 (8.2/8.3 không dính) | OOB write qua `bccomp()` |
+| CVE-2026-49261 | **MariaDB** (Galera) | 10.6.x, 10.11.x, 11.4.x, 11.8.x, 12.3.1 | CVSS 10.0, chỉ khi bật `wsrep_notify_cmd` |
+| CVE-2026-53488 | **containerd** | < 1.7.33 / 2.0.10 / 2.1.9 / 2.2.5 / 2.3.2 | LABEL của image dẫn tới thực thi lệnh trên host |
+| CVE-2026-34486 | **Tomcat** | đúng 11.0.20 / 10.1.53 / 9.0.116 | EncryptInterceptor bị bypass — traffic cluster tưởng mã hoá nhưng không |
+| CVE-2026-44578 | **Next.js** | 13.4.13 → < 15.5.16, 16.x < 16.2.5 | SSRF qua WebSocket upgrade. **Chỉ self-hosted Node server** — tức đúng mô hình VPS |
+| CVE-2026-44574 / CVE-2026-64642 | **Next.js** | 15.4.0 → < 15.5.16, 16.x < 16.2.5 / 16.0–16.2.10 | Bypass phân quyền ở middleware |
+| CVE-2026-32475 | **Elementor Pro** | ≤ 4.2.1 | Upload file tuỳ ý → chiếm site. ~6 triệu lượt cài |
+| CVE-2026-10795 | **UpdraftPlus** | ≤ 1.26.4 | Bypass xác thực. ~3 triệu lượt cài. Plugin backup bị chiếm = mất luôn backup |
+| CVE-2026-18039 | **Essential Addons for Elementor** | < 6.7.2 | Đăng ký tài khoản với role admin, khi site mở đăng ký. ~2 triệu lượt cài |
+| CVE-2026-62103 | **Everest Forms** | ≤ 3.6.0 | PHP object injection không cần xác thực, 9.8 |
+| CVE-2026-19513 / CVE-2026-48866 | **Gravity Forms** | ≤ 3.0.2 / ≤ 2.10.0.1 | Upload file tuỳ ý, path traversal. ~1 triệu lượt cài |
+| CVE-2026-23479 / CVE-2026-25243 | **Redis** | 7.2.0 → < 8.6.3 / ≤ 8.6.3 | UAF, cần quyền đăng nhập |
+
+**Kết quả âm tính cũng là kết quả:** trong cùng khoảng thời gian đó, truy vấn NVD
+theo CPE cho mức CRITICAL/HIGH trả về **không có gì** cho `sudo`, `polkit`, `glibc`,
+`nginx`, `OpenSSL`, `systemd`, `Apache httpd`, `MySQL` và `Docker Engine/runc`. Nếu
+có ai — hay công cụ quét nào — nói với mày rằng đang có khủng hoảng sudo hay glibc
+đợt này, hãy đòi số CVE cụ thể và tự kiểm tra trước khi hành động.
+
+> **Một cảnh báo về nguồn tin:** trong quá trình kiểm chứng, kết quả tìm kiếm trả về
+> hai "CVE OpenSSH nghiêm trọng" kèm điểm CVSS và mô tả rất thuyết phục. Đối chiếu
+> với release notes chính thức của OpenSSH thì **không tồn tại**. Đây chính xác là
+> lý do mọi CVE phải kiểm ngược về NVD hoặc advisory của vendor trước khi đưa vào
+> kế hoạch vá.
+
+---
+
+### T11-02 — Cách VPS thực sự bị chiếm trong 2025–2026
+
+Không phải lý thuyết — đây là các mẫu xuất hiện trong báo cáo sự cố thực tế:
+
+| Mẫu tấn công | Nội dung | Dấu hiệu kiểm tra được |
+|---|---|---|
+| **Khai thác lỗ hổng vượt lên thành đường vào số 1** | Lần đầu tiên sau nhiều năm, khai thác lỗ hổng phần mềm rìa mạng vượt qua credential bị đánh cắp để trở thành vector truy cập ban đầu phổ biến nhất | Xem T7 — thời gian vá là chỉ số rủi ro trực tiếp |
+| **Panel hosting bị khai thác hàng loạt** | Lỗi bypass xác thực pre-auth trên cPanel/WHM và leo thang tenant→root qua plugin LiteSpeed | T10-02 |
+| **Infostealer → môi giới truy cập** | Malware trên **máy nhân viên** lấy SSH key, credential VPN, mật khẩu panel lưu trong trình duyệt; môi giới bán lại cho nhóm ransomware | Không kiểm tra được trên VPS. Đây là rủi ro nằm ở máy trạm của team |
+| **Ransomware Linux/ESXi** | Vào qua credential VPN hoặc CVE thiết bị rìa, phá backup trước, mã hoá sau | T10-04, T8-08 |
+| **Redis rogue-replication botnet** | `CONFIG SET dir /etc/cron.d` + `SLAVEOF` tới Redis giả, RDB rơi xuống thành cron chạy miner | T4-02 (script kiểm tra `role` và `master_host`) |
+| **Worm cryptojacking qua Docker 2375 + Redis** | Tự lan qua Docker socket phơi ra và Redis không auth | T1-01, T5-04 |
+| **Proxyjacking** | Bán băng thông của máy nạn nhân. CPU gần như không tăng nên né hoàn toàn heuristic "máy có nóng không" | T8-01 (script khớp tên earnapp/honeygain/packetstream…) |
+| **Worm npm/PyPI đánh cắp token** | Chạy từ hook `preinstall`, lấy npm token, GitHub PAT, AWS credential, SSH key, rồi tự phát tán | T6-01, T6-02 |
+| **Rootkit eBPF và io_uring** | Không cần kernel module, không hiện trong `lsmod`; io_uring vòng qua các hook giám sát dựa trên syscall | T8-04 (`bpftool prog show`) |
+
+**Điều rút ra quan trọng nhất cho mô hình agency:** hai trong số các đường vào phổ
+biến nhất — infostealer trên máy nhân viên, và credential bị rò — **không nằm trên
+VPS**. Không có bản audit server nào phát hiện được chúng. Đó là lý do MFA cho SSH
+và cho panel nhà cung cấp có giá trị cao hơn gần như mọi biện pháp cứng hoá khác.
+
+---
+
 ## 10. BẢNG CHẤM ĐIỂM
 
 Chấm từng tier theo thang: **PASS** / **WARN** / **FAIL** / **N/A**
@@ -1485,11 +1772,21 @@ Chấm từng tier theo thang: **PASS** / **WARN** / **FAIL** / **N/A**
 | T7 | CVE và tấn công nâng cao | ×2 | |
 | T6 | Supply chain / CI-CD | ×1 | |
 | T9 | Giám sát và phục hồi | ×2 | |
+| T10 | Rủi ro agency đa khách hàng | ×3 | |
+| T11 | CVE 2026 và mẫu tấn công hiện hành | ×2 | |
 
 **Quy tắc kết luận:**
 - Bất kỳ **FAIL** nào ở T8 → xử lý sự cố, dừng audit, chuyển sang quy trình ứng phó
 - Bất kỳ **FAIL** nào ở T1/T2/T4 → rủi ro CRITICAL, xử lý trong 24h
+- **FAIL** ở T10-01 (không cách ly giữa các site) → rủi ro CRITICAL cho toàn bộ
+  danh mục khách hàng, không chỉ một site
 - ≥ 3 **WARN** ở cùng một tier → coi như FAIL của tier đó
+
+**Quy tắc về ô "KHÔNG XÁC ĐỊNH":** script v2 phân biệt ba trạng thái. Một mục ra
+`KHÔNG XÁC ĐỊNH` (công cụ chưa cài, thiếu quyền, log đã xoay hết) **không được tính
+là PASS**. Nó là việc phải làm rõ bằng cách khác. Bản v1 in "OK" cho những trường
+hợp này — đó là lỗi nghiêm trọng, vì một báo cáo bảo mật nói "OK" khi thực ra nó
+không kiểm tra được gì còn nguy hiểm hơn là báo lỗi thẳng.
 
 ---
 
