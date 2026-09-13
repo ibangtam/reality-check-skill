@@ -794,7 +794,12 @@ grep -E '^listen_addresses' /etc/postgresql/*/main/postgresql.conf 2>/dev/null
 
 **Lệnh check:**
 ```bash
-grep -E '^(bind|requirepass|protected-mode|rename-command|port)' /etc/redis/redis.conf 2>/dev/null
+# KHÔNG grep thẳng 'requirepass' — nó in mật khẩu Redis ra màn hình và vào file log.
+# Chỉ hỏi CÓ / KHÔNG:
+grep -E '^\s*(bind|protected-mode|port|tls-port|unixsocket)' /etc/redis/redis.conf 2>/dev/null
+grep -qE '^\s*requirepass\s+\S' /etc/redis/redis.conf 2>/dev/null \
+  && echo 'requirepass: CÓ ĐẶT' || echo 'requirepass: KHÔNG ĐẶT [CỜ ĐỎ]'
+grep -qE '^\s*rename-command' /etc/redis/redis.conf 2>/dev/null && echo 'rename-command: CÓ'
 
 # Thử kết nối không mật khẩu — nếu ra PONG là hỏng nặng
 redis-cli ping 2>/dev/null
@@ -827,7 +832,8 @@ grep -E 'network.host|xpack.security.enabled' /etc/elasticsearch/elasticsearch.y
 ```bash
 redis-cli config get dir 2>/dev/null      # nếu trỏ tới /root/.ssh hoặc /var/spool/cron → đã bị khai thác
 redis-cli config get dbfilename 2>/dev/null
-redis-cli --scan --pattern '*' 2>/dev/null | head -20
+redis-cli dbsize 2>/dev/null   # chỉ đếm key, KHÔNG liệt kê tên key
+# (tên key có thể chứa dữ liệu định danh của khách hàng — đừng đổ vào file audit)
 ```
 
 ---

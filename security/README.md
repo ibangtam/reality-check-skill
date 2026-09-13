@@ -101,4 +101,41 @@ gây báo động giả, đọc log qua cả journald và file đã xoay, so kh�
 dẫn đầy đủ, thêm phương pháp kiểm tra CVE có tính tới backport của distro, thêm
 TIER 10 (rủi ro agency đa khách hàng) và TIER 11 (CVE 2026).
 
+**v2.1** — sau vòng verify thứ hai, chạy thật với fixture có cài sẵn lỗi. Bản v2.0
+có một lỗi **nghiêm trọng hơn cả v1**:
+
+- `ffind()` — helper đứng sau toàn bộ 28 lượt quét filesystem — là một lỗi cú pháp
+  `find`. Nó trả về `find: invalid expression`, exit 1, rỗng, và `2>/dev/null` nuốt
+  mất thông báo lỗi. Hệ quả: mọi mục quét file đều rỗng rồi được báo cáo là **SẠCH**.
+  Test với webshell, SUID backdoor, `.env` quyền 777 và archive 110MB cài sẵn: v2.0
+  báo sạch cả 5, và báo "tổng số binary SUID tìm thấy: 0" trên máy có 13 cái.
+- Bài học rút ra đã được đưa thẳng vào script: có một hàm `_ffind_selftest` chạy lúc
+  khởi động, và script **dừng hẳn** nếu quét filesystem không hoạt động. Báo cáo
+  không có còn hơn báo cáo nói sạch mà chưa kiểm tra gì.
+
+Sửa thêm trong v2.1:
+- `redact()` bỏ sót dạng phổ biến nhất: `password = x`, `db_password: x`,
+  `define('DB_PASSWORD', ...)`, `curl -u user:pass`, `sshpass -p`, `--password VALUE`
+  có khoảng trắng, AWS secret key, thân private key, `.pgpass`, Redis ACL. Nay test
+  bằng bộ 26 mẫu, che 26/26, vẫn giữ được ngữ cảnh để đọc IoC.
+- Bốn chỗ in nội dung mà không qua `redact()`: tuỳ chọn nhúng trong `authorized_keys`,
+  hook `apt.conf.d`, module PAM, cấu hình chuyển tiếp `rsyslog`.
+- Histogram username đăng nhập sai in nguyên văn mật khẩu gõ nhầm vào ô username.
+- 19 chỗ `|| ok "..."` gắn sau pipeline là dead code — exit status là của `sed`/`head`,
+  luôn bằng 0, nên nhánh dự phòng không bao giờ chạy và check im lặng không có kết
+  luận. Thay bằng helper `emit`.
+- `_stale` trong mục needs-restart bị mất giá trị do subshell → luôn in SẠCH.
+- Phát hiện panel gán cờ từ exit status của pipeline → mọi máy đều báo có panel.
+- `xargs` vỡ khi gặp tên file có dấu nháy → chuyển sang `-print0`/`-0`.
+- `find` sai độ ưu tiên toán tử làm rơi `fullchain.pem`/`cert.pem` khỏi mục TLS.
+- SUID đếm được 0 nay báo KHÔNG XÁC ĐỊNH (Linux thật luôn có vài SUID; 0 nghĩa là
+  quét hỏng).
+- Thêm `timeout` cho `df`, `findmnt`, `fail2ban-client` — treo vô hạn trên mount hỏng.
+- Header nói rõ ngoại lệ duy nhất về mạng: `redis-cli` PING/CONFIG GET/INFO có mở
+  kết nối tới Redis localhost, vì câu hỏi "Redis có đòi mật khẩu không" chỉ trả lời
+  được bằng cách thử.
+
+**v2.0** — sửa ba lỗi của v1 (xem mô tả commit). Nhưng chưa được test với fixture,
+nên lỗi `ffind` ở trên lọt qua.
+
 **v1.0** — bản đầu.

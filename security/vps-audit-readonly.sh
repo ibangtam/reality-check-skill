@@ -21,7 +21,12 @@
 #   - ghi/sửa/xoá bất kỳ file nào của hệ thống
 #   - nạp hay thực thi code của ứng dụng đang chạy trên máy (không wp-cli,
 #     không drush, không artisan, không php script của webroot)
-#   - kết nối tới database của ứng dụng
+#   - kết nối tới database của ứng dụng (MySQL/PostgreSQL/MongoDB: chỉ đọc file
+#     cấu hình, không mở kết nối nào)
+#   NGOẠI LỆ DUY NHẤT, nói rõ để không ai bất ngờ: mục T4-02 có gọi redis-cli với
+#   PING, CONFIG GET và INFO REPLICATION trên 127.0.0.1. Ba lệnh này chỉ đọc, nhưng
+#   chúng CÓ mở kết nối tới Redis. Mục đích: câu hỏi "Redis có đòi mật khẩu không"
+#   chỉ trả lời được bằng cách thử. Không muốn thì bỏ qua mục đó.
 #   - cài/gỡ/cập nhật package, start/stop/restart/enable/disable service
 #   - thay đổi firewall, user, quyền, hay bất kỳ cấu hình nào
 # Mạng: mặc định KHÔNG gửi gì ra internet. Hai kiểm tra tuỳ chọn có dùng mạng,
@@ -66,6 +71,16 @@ unknown() { printf '   [KHÔNG XÁC ĐỊNH — check không chạy được] %s
 flag()    { printf '   [!! CỜ ĐỎ] %s\n' "$*"; }
 note()    { printf '   -> %s\n' "$*"; }
 
+# emit <ok|unknown|flag> <thông điệp khi RỖNG> [tiền tố]
+# Giải quyết lỗi kinh điển: `cmd | sed ... || ok "..."` — exit status là của sed,
+# luôn bằng 0, nên nhánh `|| ok` không bao giờ chạy và check im lặng không có kết luận.
+emit() {
+  local kind="$1" msg="$2" pfx="${3:-  }" out
+  out=$(cat)
+  if [ -n "$out" ]; then printf '%s\n' "$out" | sed "s|^|$pfx|"
+  else "$kind" "$msg"; fi
+}
+
 # Chạy 1 check: nếu công cụ không có -> KHÔNG XÁC ĐỊNH; có output -> in; rỗng -> SẠCH
 # dùng: check_tool <tên công cụ> <mô tả khi sạch> -- <lệnh...>
 check_tool() {
@@ -78,21 +93,85 @@ check_tool() {
 # Che giá trị credential nhưng GIỮ phần còn lại của dòng để vẫn đọc được IoC
 redact() {
   sed -E \
-    -e 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]]+@#\1***DA-CHE***@#g' \
-    -e 's#((mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)[^|;&]*[[:space:]]-p)[^[:space:]]+#\1***DA-CHE***#g' \
-    -e 's#(--(password|pass|passphrase|token|api-key|http-password|ftp-password)=)[^[:space:]]+#\1***DA-CHE***#g' \
-    -e 's#^([[:space:]]*(requirepass|masterauth|rename-command)[[:space:]]+).*#\1***DA-CHE***#I' \
-    -e 's#([A-Za-z_][A-Za-z0-9_]*(PASS|PASSWD|PASSWORD|PWD|TOKEN|SECRET|APIKEY|API_KEY|PASSPHRASE)[A-Z0-9_]*=)[^[:space:]]+#\1***DA-CHE***#g' \
-    -e 's#(Authorization:[[:space:]]*(Bearer|Basic)[[:space:]]+)[^[:space:]"'"'"']+#\1***DA-CHE***#gI' \
-    -e 's#/[0-9a-fA-F]{16,}(/|$)#/***TOKEN-DA-CHE***\1#g' \
+    `# URL userinfo — không dùng lớp phủ định có @, để bắt cả mật khẩu chứa @` \
+    -e 's#([A-Za-z][A-Za-z0-9+.-]*://)[^/[:space:]]*@#\1***DA-CHE***@#g' \
+    `# mật khẩu trong dấu nháy (chứa khoảng trắng) phải xử lý TRƯỚC dạng không nháy` \
+    -e "s#([[:space:]]-p)'[^']*'#\1***DA-CHE***#g" \
+    -e 's#([[:space:]]-p)"[^"]*"#\1***DA-CHE***#g' \
+    -e 's#((mysql|mysqldump|mysqladmin|mariadb|mariadb-dump|mysqlcheck)[^|;&]*[[:space:]]-p)[^[:space:]]+#\1***DA-CHE***#g' \
+    `# --password=VALUE và --password VALUE (có khoảng trắng)` \
+    -e 's#(--[a-z-]*(password|passwd|pass|passphrase|token|api-key|secret)[a-z-]*=)[^[:space:]]+#\1***DA-CHE***#gI' \
+    -e 's#(--[a-z-]*(password|passwd|passphrase|token|api-key)[a-z-]*[[:space:]]+)[^[:space:]-][^[:space:]]*#\1***DA-CHE***#gI' \
+    `# curl -u user:pass  /  wget --user=x --password=y  /  sshpass -p` \
+    -e 's#([[:space:]]-u[[:space:]]+[^[:space:]:]+):[^[:space:]]+#\1:***DA-CHE***#g' \
+    -e 's#(sshpass[[:space:]]+-p[[:space:]]*)[^[:space:]]+#\1***DA-CHE***#g' \
+    `# gán biến/khoá: HOA hoặc thường, dấu = hoặc :, có hoặc không khoảng trắng, có hoặc không nháy` \
+    -e 's#(([A-Za-z_][A-Za-z0-9_.-]*)?(pass|passwd|password|pwd|secret|token|apikey|api_key|api-key|passphrase|auth)[A-Za-z0-9_.-]*[[:space:]]*[=:][[:space:]]*)("|'"'"')?[^[:space:],;)"'"'"']+#\1\4***DA-CHE***#gI' \
+    `# define('"'"'DB_PASSWORD'"'"', '"'"'...'"'"') của WordPress` \
+    -e "s#(define\\([[:space:]]*['\"][A-Z_]*(PASS|PASSWORD|SECRET|KEY|SALT)[A-Z_]*['\"][[:space:]]*,[[:space:]]*)['\"][^'\"]*['\"]#\1'***DA-CHE***'#gI" \
+    `# dòng cấu hình chỉ có khoá + giá trị (redis, mail...)` \
+    -e 's#^([[:space:]]*(requirepass|masterauth)[[:space:]]+).*#\1***DA-CHE***#I' \
+    -e 's#(^[[:space:]]*user[[:space:]]+[^[:space:]]+.*>)[^[:space:]]+#\1***DA-CHE***#I' \
+    `# rename-command: che TÊN MỚI nhưng giữ tên gốc để còn đọc được ý nghĩa` \
+    -e 's#^([[:space:]]*rename-command[[:space:]]+[A-Za-z]+[[:space:]]+).*#\1***DA-CHE***#I' \
+    `# HTTP auth` \
+    -e 's#(Authorization:[[:space:]]*(Bearer|Basic|Token)[[:space:]]+)[^[:space:]"'"'"']+#\1***DA-CHE***#gI' \
+    `# .pgpass: host:port:db:user:password` \
+    -e 's#^(([^:[:space:]]*:){4})[^:[:space:]]+$#\1***DA-CHE***#' \
+    `# token có tiền tố nhận dạng được` \
     -e 's#(gh[pousr]_)[A-Za-z0-9]{20,}#\1***DA-CHE***#g' \
+    -e 's#(github_pat_)[A-Za-z0-9_]{20,}#\1***DA-CHE***#g' \
     -e 's#(glpat-)[A-Za-z0-9_-]{15,}#\1***DA-CHE***#g' \
-    -e 's#(sk-(ant-|proj-)?)[A-Za-z0-9_-]{20,}#\1***DA-CHE***#g' \
-    -e 's#(AKIA)[0-9A-Z]{16}#\1***DA-CHE***#g'
+    -e 's#(xox[baprs]-)[A-Za-z0-9-]{10,}#\1***DA-CHE***#g' \
+    -e 's#(sk-(ant-|proj-|live-|test-)?)[A-Za-z0-9_-]{20,}#\1***DA-CHE***#g' \
+    -e 's#(AKIA)[0-9A-Z]{16}#\1***DA-CHE***#g' \
+    -e 's#(hooks\.slack\.com/services/)[A-Za-z0-9/]+#\1***DA-CHE***#g' \
+    `# AWS secret access key: 40 ký tự base64, chỉ che khi đứng sau dấu hiệu ngữ cảnh` \
+    -e 's#((secret|aws_secret_access_key)[^[:space:]]*[[:space:]]*[=:][[:space:]]*)[A-Za-z0-9/+=]{40}#\1***DA-CHE***#gI' \
+    `# query string token` \
+    -e 's#([?&](token|key|api_key|access_token|auth)=)[^&[:space:]]+#\1***DA-CHE***#gI' \
+    `# thân private key — không bao giờ được lọt ra` \
+    -e 's#^[A-Za-z0-9+/]{60,}={0,2}$#***THAN-KEY-DA-CHE***#'
 }
 
-# find toàn filesystem có kiểm soát: loại trừ pseudo-fs, không vượt mount point
-ffind() { find "$@" \( "${PRUNE[@]}" \) -prune -o 2>/dev/null; }
+# find toàn filesystem có kiểm soát: loại trừ pseudo-fs, không vượt mount point.
+# Tách rõ <paths> <global options> <expression> — sai thứ tự này thì find trả về
+# "invalid expression", exit 1, và nếu nuốt stderr thì mọi check đều ra RỖNG rồi
+# bị báo cáo nhầm thành SẠCH. Bản trước của script mắc đúng lỗi đó.
+ffind() {
+  local paths=() gopts=()
+  while [ $# -gt 0 ]; do case "$1" in -*) break ;; *) paths+=("$1"); shift ;; esac; done
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -xdev|-mount|-follow)  gopts+=("$1"); shift ;;
+      -maxdepth|-mindepth)   gopts+=("$1" "$2"); shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [ ${#paths[@]} -eq 0 ] && return 2
+  find "${paths[@]}" -xdev "${gopts[@]}" \( "${PRUNE[@]}" \) -prune -o \( "$@" \) 2>/dev/null
+}
+
+# TỰ KIỂM TRA ffind. Nếu helper này hỏng, toàn bộ phần quét filesystem sẽ im lặng
+# trả rỗng và báo cáo sẽ nói "sạch" trên một máy đầy webshell. Thà dừng còn hơn.
+_ffind_selftest() {
+  local d; d=$(mktemp -d) || return 1
+  : > "$d/ffind-canary.txt"
+  local got; got=$(ffind "$d" -maxdepth 2 -name 'ffind-canary.txt' -print)
+  rm -rf "$d"
+  [ -n "$got" ]
+}
+if ! _ffind_selftest; then
+  echo
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "!! DỪNG: hàm quét filesystem (ffind) KHÔNG hoạt động trên máy này."
+  echo "!! Mọi kết quả quét file sẽ rỗng và báo cáo sẽ SAI theo hướng nguy hiểm"
+  echo "!! (báo sạch trong khi chưa hề kiểm tra). Không dùng kết quả của lần chạy này."
+  echo "!! Gửi lại thông tin: find --version | head -1"
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  find --version 2>&1 | head -1
+  exit 3
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "!! CẢNH BÁO: không chạy bằng root — rất nhiều mục sẽ ra KHÔNG XÁC ĐỊNH."
@@ -102,11 +181,11 @@ fi
 sec "THÔNG TIN CƠ BẢN"
 sub "Thời điểm audit";  date -u '+%Y-%m-%d %H:%M:%S UTC'; date '+%Y-%m-%d %H:%M:%S %Z (giờ máy)'
 sub "Đồng hồ hệ thống (lệch giờ làm hỏng forensic và TLS)"
-timedatectl 2>/dev/null | head -8 || unknown "timedatectl"
+timedatectl 2>/dev/null | head -8 | emit unknown "timedatectl"
 sub "Hostname / Kernel"; uname -a
 sub "Distro"; grep -E '^(NAME|VERSION|VERSION_ID|VERSION_CODENAME|ID)=' /etc/os-release 2>/dev/null
 sub "Uptime"; uptime
-sub "Tài nguyên"; free -h 2>/dev/null; echo; df -hT 2>/dev/null | grep -vE 'tmpfs|devtmpfs'
+sub "Tài nguyên"; free -h 2>/dev/null; echo; timeout 20 df -hT 2>/dev/null | grep -vE 'tmpfs|devtmpfs'
 sub "Ảo hoá / container"; systemd-detect-virt 2>/dev/null || echo "n/a"
 [ -f /.dockerenv ] && flag "Chính script này đang chạy TRONG container, không phải trên host"
 sub "Script chạy với quyền"; id
@@ -152,7 +231,7 @@ while IFS= read -r f; do
   echo "  số key: $(grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)"
   # tuỳ chọn nguy hiểm nhúng trong dòng key — rất ít người để ý
   grep -oE '^(command|from|environment|permitopen|tunnel)="[^"]*"' "$f" 2>/dev/null | \
-    sed 's/^/  TUỲ CHỌN NHÚNG: /'
+    redact | sed 's/^/  TUỲ CHỌN NHÚNG: /'
 done < <(printf '%s\n' /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 /home/*/.ssh/authorized_keys /home/*/.ssh/authorized_keys2 2>/dev/null)
 [ "$_akf" = 0 ] && ok "không có file authorized_keys nào"
 note "ĐỐI CHIẾU TỪNG FINGERPRINT với danh sách key hợp lệ của team. Một key lạ = một cửa hậu."
@@ -206,7 +285,7 @@ sub "T8-03 Persistence NGOÀI cron/systemd (v1 bỏ sót hoàn toàn)"
 echo "  [PAM] module nạp từ đường dẫn lạ:"
 grep -rhE '^\s*(auth|account|session|password)\s+.*\.so' /etc/pam.d/ 2>/dev/null | \
   grep -vE 'pam_(unix|deny|permit|env|limits|systemd|motd|mail|umask|keyinit|loginuid|selinux|namespace|lastlog|faildelay|nologin|securetty|succeed_if|faillock|tally2|pwquality|cracklib|gnome|sss|winbind|krb5|ldap|exec|access|time|group|mkhomedir|oath|google_authenticator|u2f|yubico|duo|cap|debug|issue|filter|localuser|rootok|xauth)\.so' | \
-  sed 's/^/    /' | head -15 || true
+  redact | sed 's/^/    /' | head -15 || true
 echo "  [shell rc] lệnh chạy ngầm trong rc file:"
 grep -lE '(curl|wget|/dev/tcp|base64 -d|nc -e|eval \$\()' \
   /root/.bashrc /root/.bash_profile /root/.profile /home/*/.bashrc /home/*/.profile \
@@ -215,7 +294,7 @@ echo "  [LD_AUDIT / ld.so] :"
 grep -rhE 'LD_AUDIT|LD_PRELOAD|LD_LIBRARY_PATH' /etc/environment /etc/profile /etc/profile.d/* /etc/systemd/system.conf 2>/dev/null | sed 's/^/    /' || true
 ls -la /etc/ld.so.conf.d/ 2>/dev/null | tail -n +2 | head -10
 echo "  [apt/dpkg hook] — chạy mỗi lần apt chạy:"
-grep -rhE 'DPkg::|APT::Update::|Pre-Invoke|Post-Invoke' /etc/apt/apt.conf.d/ 2>/dev/null | grep -vE '^\s*//' | sed 's/^/    /' | head -15 || true
+grep -rhE 'DPkg::|APT::Update::|Pre-Invoke|Post-Invoke' /etc/apt/apt.conf.d/ 2>/dev/null | grep -vE '^\s*//' | redact | sed 's/^/    /' | head -15 || true
 echo "  [git hook trong webroot] — chạy khi deploy:"
 ffind /var/www /srv /opt /home -maxdepth 6 -path '*/.git/hooks/*' -type f ! -name '*.sample' -print 2>/dev/null | head -15 | sed 's/^/    /' || true
 echo "  [motd / update-motd] :"
@@ -321,8 +400,9 @@ else ok "không thấy cấu hình tắt history"; fi
 
 sub "T8-06 File có thuộc tính immutable (attacker dùng để khoá file của mình)"
 if has lsattr; then
-  ffind /etc /root /var/www /usr/bin /usr/sbin -maxdepth 4 -type f -print 2>/dev/null | \
-    head -4000 | xargs -r lsattr 2>/dev/null | grep -E '^....i' | head -20 | sed 's/^/  /' || ok "không có file immutable trong các thư mục đã quét"
+  _imm=$(ffind /etc /root /var/www /usr/bin /usr/sbin -maxdepth 4 -type f -print0 | \
+    xargs -0 -r lsattr 2>/dev/null | grep -E '^....i' | head -20)
+  if [ -n "$_imm" ]; then printf '%s\n' "$_imm" | sed 's/^/  /'; else ok "không có file immutable trong các thư mục đã quét"; fi
 else unknown "lsattr"; fi
 
 sub "T8-07 Kết nối mạng đang mở kèm tiến trình"
@@ -347,7 +427,7 @@ note "Entry lạ trong /etc/hosts là kỹ thuật chặn update AV/license. Res
 sub "T8-08 Dấu hiệu chuẩn bị ransomware (staging + exfil)"
 _big=$(ffind /tmp /var/tmp /dev/shm /home /root -maxdepth 4 -type f -size +100M \
         \( -name '*.zip' -o -name '*.rar' -o -name '*.7z' -o -name '*.tar*' -o -name '*.enc' \) \
-        -printf '%TY-%Tm-%Td %10s %p\n' -print 2>/dev/null | head -20)
+        -printf '%TY-%Tm-%Td %10s %p\n'  2>/dev/null | head -20)
 if [ -n "$_big" ]; then printf '%s\n' "$_big" | sed 's/^/  /'; flag "Có archive lớn ở thư mục tạm — có thể là staging trước khi exfil"
 else ok "không có archive lớn bất thường ở thư mục tạm"; fi
 _tool=$(ps aux 2>/dev/null | grep -iE 'rclone|megacmd|mega-cmd|filezilla|ncftp|lftp|croc|magic-wormhole' | grep -v grep)
@@ -388,7 +468,11 @@ if [ "$_fc" -gt 0 ]; then
   echo "  --- Top 15 IP:"
   printf '%s\n' "$_fail" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort | uniq -c | sort -rn | head -15 | sed 's/^/    /'
   echo "  --- Top 10 username bị thử:"
-  printf '%s\n' "$_fail" | sed -n 's/.*for \(invalid user \)\?\([^ ]*\) from.*/\2/p' | sort | uniq -c | sort -rn | head -10 | sed 's/^/    /'
+  # CHÚ Ý: người dùng hay gõ nhầm mật khẩu vào ô username, nên danh sách này có thể
+  # chứa mật khẩu thật. Chỉ in username khớp dạng tên tài khoản hợp lệ, phần còn lại gộp lại đếm.
+  printf '%s\n' "$_fail" | sed -n 's/.*for \(invalid user \)\?\([^ ]*\) from.*/\2/p' | \
+    awk '/^[a-zA-Z_][a-zA-Z0-9._-]{0,31}$/{print; next} {other++} END{if(other) print "(" other " chuỗi không giống username — đã ẩn, có thể là mật khẩu gõ nhầm)"}' | \
+    sort | uniq -c | sort -rn | head -10 | sed 's/^/    /'
 else
   unknown "không tìm thấy bản ghi nào — log đã bị xoay hết, hoặc distro chỉ dùng journald và journald đã bị giới hạn"
 fi
@@ -406,8 +490,8 @@ flag "BẤT KỲ IP NÀO Ở TRÊN MÀ MÀY KHÔNG NHẬN RA = coi như đã b�
 
 sub "T2-02 fail2ban / CrowdSec"
 if has fail2ban-client; then
-  fail2ban-client status 2>/dev/null | sed 's/^/  /' || unknown "fail2ban đã cài nhưng không chạy"
-  fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'
+  timeout 20 fail2ban-client status 2>/dev/null | emit unknown "fail2ban đã cài nhưng không chạy" '  '
+  timeout 20 fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'
 else unknown "fail2ban chưa cài"; fi
 has cscli && timeout 15 cscli metrics 2>/dev/null | head -20 || true
 
@@ -504,12 +588,12 @@ fi
 sec "TIER 4 — TẦNG DỮ LIỆU"
 
 sub "T4-01 MySQL/MariaDB — bind address"
-grep -rhE '^[[:space:]]*(bind-address|skip-networking|port)' /etc/mysql/ /etc/my.cnf /etc/my.cnf.d/ /etc/mysql/mysql.conf.d/ 2>/dev/null | sed 's/^/  /' || unknown "không tìm thấy cấu hình MySQL"
+grep -rhE '^[[:space:]]*(bind-address|skip-networking|port)' /etc/mysql/ /etc/my.cnf /etc/my.cnf.d/ /etc/mysql/mysql.conf.d/ 2>/dev/null | emit unknown "không tìm thấy cấu hình MySQL" '  '
 note "Script v2 KHÔNG kết nối vào database. Kiểm tra tài khoản DB bằng tay:"
 note "  mysql -e \"SELECT user,host,plugin FROM mysql.user;\"   ← host '%' = cờ đỏ"
 
 sub "T4-01 PostgreSQL"
-grep -rhE '^[[:space:]]*listen_addresses' /etc/postgresql/*/main/postgresql.conf /var/lib/pgsql/data/postgresql.conf 2>/dev/null | sed 's/^/  /' || unknown "không tìm thấy postgresql.conf"
+grep -rhE '^[[:space:]]*listen_addresses' /etc/postgresql/*/main/postgresql.conf /var/lib/pgsql/data/postgresql.conf 2>/dev/null | emit unknown "không tìm thấy postgresql.conf" '  '
 _hba=$(grep -rhvE '^[[:space:]]*(#|$)' /etc/postgresql/*/main/pg_hba.conf /var/lib/pgsql/data/pg_hba.conf 2>/dev/null | head -20)
 [ -n "$_hba" ] && printf '%s\n' "$_hba" | sed 's/^/  /'
 printf '%s\n' "$_hba" | grep -qE '(trust)' && flag "pg_hba.conf có method 'trust' — kết nối không cần mật khẩu"
@@ -550,13 +634,13 @@ if has redis-cli; then
 else unknown "redis-cli chưa cài"; fi
 
 sub "T4-02 Memcached / MongoDB / Elasticsearch"
-grep -hE '^(-l|-U|-p)' /etc/memcached.conf 2>/dev/null | sed 's/^/  memcached: /' || unknown "memcached.conf"
-grep -hE '^[[:space:]]*(bindIp|authorization|port)' /etc/mongod.conf 2>/dev/null | sed 's/^/  mongodb: /' || unknown "mongod.conf"
-grep -hE '^(network\.host|http\.port|xpack\.security\.enabled)' /etc/elasticsearch/elasticsearch.yml 2>/dev/null | sed 's/^/  elastic: /' || unknown "elasticsearch.yml"
+grep -hE '^(-l|-U|-p)' /etc/memcached.conf 2>/dev/null | emit unknown "memcached.conf" '  memcached: '
+grep -hE '^[[:space:]]*(bindIp|authorization|port)' /etc/mongod.conf 2>/dev/null | emit unknown "mongod.conf" '  mongodb: '
+grep -hE '^(network\.host|http\.port|xpack\.security\.enabled)' /etc/elasticsearch/elasticsearch.yml 2>/dev/null | emit unknown "elasticsearch.yml" '  elastic: '
 
 sub "T4-03 Backup — file dump lớn"
 ffind / -maxdepth 5 -type f \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.dump' -o -name '*.tar.gz' -o -name '*.tgz' -o -name '*.bak' \) \
-  -size +1M -printf '%TY-%Tm-%Td %10s %p\n' -print 2>/dev/null | sort -r | head -25 | sed 's/^/  /' || ok "không tìm thấy file dump lớn"
+  -size +1M -printf '%TY-%Tm-%Td %10s %p\n'  2>/dev/null | sort -r | head -25 | emit ok "không tìm thấy file dump lớn" '  '
 
 sub "T4-03 Công cụ backup + lịch chạy"
 for t in borg borgmatic restic duplicity duplicati rclone rsnapshot bacula-fd veeamagent; do has "$t" && echo "  đã cài: $t"; done
@@ -570,7 +654,7 @@ note "và thành công ở đa số trường hợp. Backup xoá được = khô
 echo "  --- credential backup lưu trên chính máy này (tên file, không in giá trị):"
 ls -la /root/.config/rclone/rclone.conf /root/.borg* /etc/borgmatic* /root/.restic* 2>/dev/null | sed 's/^/    /' || echo "    (không tìm thấy)"
 echo "  --- mount point từ xa (backup nằm cùng máy = mất cùng máy):"
-findmnt -t nfs,nfs4,cifs,fuse.sshfs,fuse.rclone -o TARGET,SOURCE,FSTYPE 2>/dev/null | sed 's/^/    /' || echo "    (không có mount từ xa)"
+timeout 20 findmnt -t nfs,nfs4,cifs,fuse.sshfs,fuse.rclone -o TARGET,SOURCE,FSTYPE 2>/dev/null | sed 's/^/    /' || echo "    (không có mount từ xa)"
 echo
 echo "  TRẢ LỜI BẰNG TAY 4 CÂU SAU — script không tự kiểm tra được:"
 echo "    1. Backup có bản off-site mà credential trên VPS này KHÔNG xoá được không?"
@@ -580,11 +664,12 @@ echo "    3. Backup có mã hoá không? Key lưu ở đâu — có nằm trên 
 echo "    4. Nếu VPS bị mã hoá lúc 2h sáng nay, mất tối đa bao nhiêu giờ dữ liệu?"
 
 sub "T4-04 File CHỨA credential (CHỈ in tên file + quyền, KHÔNG in giá trị)"
-ffind /etc /opt /srv /var/www /root /home -maxdepth 6 -type f \
+_cred=$(ffind /etc /opt /srv /var/www /root /home -maxdepth 6 -type f \
   \( -name '*.conf' -o -name '*.yml' -o -name '*.yaml' -o -name '.env*' -o -name '*.ini' -o -name '*.json' -o -name '*.php' -o -name '*.sh' \) \
-  -print 2>/dev/null | head -8000 | \
-  xargs -r grep -lI -E '(password|passwd|secret|api[_-]?key|token|private[_-]?key)[[:space:]]*[=:]' 2>/dev/null | \
-  head -40 | while read -r f; do stat -c '  %a %U:%G  %n' "$f" 2>/dev/null; done || ok "không tìm thấy"
+  -print0 | xargs -0 -r grep -lI -E '(password|passwd|secret|api[_-]?key|token|private[_-]?key)[[:space:]]*[=:]' 2>/dev/null | head -40)
+if [ -n "$_cred" ]; then
+  printf '%s\n' "$_cred" | while IFS= read -r f; do stat -c '  %a %U:%G  %n' "$f" 2>/dev/null; done
+else ok "không tìm thấy file cấu hình nào chứa từ khoá credential"; fi
 note "File ở đây quyền 644 hoặc rộng hơn = mọi user trên máy đọc được credential."
 
 sub "T4-04 Private key và quyền (phải là 600)"
@@ -608,10 +693,12 @@ done
 note "Key không passphrase + máy bị chiếm = attacker đi tiếp sang mọi server mà key đó vào được."
 
 sub "T4-04 Credential trong biến môi trường tiến trình (chỉ in TÊN BIẾN)"
-for p in /proc/[0-9]*; do
-  _v=$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | grep -oiE '^[A-Z_]*(PASS|PASSWD|PASSWORD|SECRET|TOKEN|API_?KEY)[A-Z_]*' | sort -u | tr '\n' ' ')
-  [ -n "$_v" ] && echo "  PID ${p#/proc/} ($(cat "$p/comm" 2>/dev/null)): $_v"
-done 2>/dev/null | head -20 || ok "không tiến trình nào có credential trong env"
+_envc=$( for p in /proc/[0-9]*; do
+    _v=$( { tr '\0' '\n' < "$p/environ"; } 2>/dev/null | grep -oiE '^[A-Z_]*(PASS|PASSWD|PASSWORD|SECRET|TOKEN|API_?KEY)[A-Z_]*' | sort -u | tr '\n' ' ')
+    [ -n "$_v" ] && echo "  PID ${p#/proc/} ($(cat "$p/comm" 2>/dev/null)): $_v"
+  done 2>/dev/null | head -20 )
+if [ -n "$_envc" ]; then printf '%s\n' "$_envc"
+else ok "không tiến trình nào có credential trong env"; fi
 note "Mọi user trên máy đọc được /proc/<pid>/environ của tiến trình cùng user."
 
 # ==================== TIER 3: ỨNG DỤNG WEB ====================
@@ -626,7 +713,7 @@ grep -rhE '^\s*(server_name|root)\s' /etc/nginx/sites-enabled/ /etc/nginx/conf.d
 echo "  --- apache ServerName / DocumentRoot:"
 grep -rhE '^\s*(ServerName|ServerAlias|DocumentRoot)\s' /etc/apache2/sites-enabled/ /etc/httpd/conf.d/ 2>/dev/null | sed 's/^/    /' | head -60 || true
 echo "  --- PHP-FPM pool: mỗi pool chạy user nào (pool riêng/user riêng = cách ly tốt):"
-grep -rhE '^\s*(\[|user|group|listen)\s*=?' /etc/php/*/fpm/pool.d/*.conf /etc/php-fpm.d/*.conf 2>/dev/null | sed 's/^/    /' | head -60 || unknown "không tìm thấy pool PHP-FPM"
+grep -rhE '^\s*(\[|user|group|listen)\s*=?' /etc/php/*/fpm/pool.d/*.conf /etc/php-fpm.d/*.conf 2>/dev/null | sed 's/^/    /' | head -60 | emit unknown "không tìm thấy pool PHP-FPM"
 echo "  --- chủ sở hữu các webroot:"
 for d in /var/www/* /home/*/public_html /srv/www/*; do
   [ -d "$d" ] || continue
@@ -639,8 +726,10 @@ _pan=0
 for p in /usr/local/cpanel /usr/local/psa /opt/psa /usr/local/CyberCP /www/server/panel /usr/share/webmin /etc/webmin /usr/local/directadmin /usr/local/vesta /usr/local/hestia /usr/local/lsws; do
   [ -e "$p" ] && { echo "  PHÁT HIỆN PANEL: $p"; _pan=1; }
 done
-ffind /var/www /usr/share /srv -maxdepth 4 -type d \( -name 'phpmyadmin' -o -name 'phpMyAdmin' -o -name 'adminer*' -o -name 'pma' \) -print 2>/dev/null | sed 's/^/  PHÁT HIỆN: /' && _pan=1 || true
-ss -tlnp 2>/dev/null | grep -E ':(2082|2083|2086|2087|2095|2096|8083|8090|7080|10000|8443|4643)[[:space:]]' | sed 's/^/  port panel: /' && _pan=1 || true
+_pma=$(ffind /var/www /usr/share /srv -maxdepth 4 -type d \( -name 'phpmyadmin' -o -name 'phpMyAdmin' -o -name 'adminer*' -o -name 'pma' \) -print)
+[ -n "$_pma" ] && { printf '%s\n' "$_pma" | sed 's/^/  PHÁT HIỆN: /'; _pan=1; }
+_pport=$(ss -tlnp 2>/dev/null | grep -E ':(2082|2083|2086|2087|2095|2096|8083|8090|7080|10000|8443|4643)[[:space:]]')
+[ -n "$_pport" ] && { printf '%s\n' "$_pport" | sed 's/^/  port panel: /'; _pan=1; }
 if [ "$_pan" = 1 ]; then
   flag "Có phần mềm panel — đây là nhóm bị khai thác hàng loạt nhiều nhất trong 12 tháng qua"
   note "cPanel/WHM, LiteSpeed plugin, CyberPanel, aaPanel, Webmin đều có CVE pre-auth nghiêm trọng gần đây."
@@ -695,13 +784,21 @@ grep -rhE 'location.*(upload|\\.php)|php_admin_flag|SetHandler|fastcgi_pass' /et
 
 sub "T3-06 Webshell — nhiều lớp phát hiện (v1 chỉ có 1 pattern, né được dễ dàng)"
 note "Không có grep nào bắt được webshell hiện đại. Ba lớp dưới đây là sàng lọc, KHÔNG phải kết luận."
-echo "  [1] Pattern eval/obfuscation kinh điển:"
-ffind /var/www /srv /home -maxdepth 7 -type f -name '*.ph*' -print 2>/dev/null | head -20000 | \
-  xargs -r grep -lE 'eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|strrev|\$_(POST|GET|REQUEST|COOKIE|SERVER))' 2>/dev/null | head -25 | sed 's/^/      /' || echo "      (không khớp)"
-echo "  [2] Hàm thực thi lệnh + biến superglobal trên cùng file:"
-ffind /var/www /srv /home -maxdepth 7 -type f -name '*.ph*' -print 2>/dev/null | head -20000 | \
-  xargs -r grep -lE '(system|shell_exec|passthru|popen|proc_open|pcntl_exec|assert)[[:space:]]*\(' 2>/dev/null | \
-  xargs -r grep -lE '\$_(POST|GET|REQUEST|COOKIE)' 2>/dev/null | head -25 | sed 's/^/      /' || echo "      (không khớp)"
+_phpn=$(ffind /var/www /srv /home -maxdepth 7 -type f -name '*.ph*' -print | grep -c .)
+echo "  số file PHP đã quét: $_phpn"
+if [ "$_phpn" -eq 0 ]; then
+  unknown "không quét được file PHP nào — KHÔNG kết luận được gì về webshell"
+else
+  echo "  [1] Pattern eval/obfuscation kinh điển:"
+  _w1=$(ffind /var/www /srv /home -maxdepth 7 -type f -name '*.ph*' -print0 | \
+    xargs -0 -r grep -lE 'eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|gzuncompress|str_rot13|strrev|\$_(POST|GET|REQUEST|COOKIE|SERVER))' 2>/dev/null | head -25)
+  if [ -n "$_w1" ]; then printf '%s\n' "$_w1" | sed 's/^/      /'; flag "Khớp pattern webshell kinh điển"; else echo "      (không khớp)"; fi
+  echo "  [2] Hàm thực thi lệnh + biến superglobal trên cùng file:"
+  _w2=$(ffind /var/www /srv /home -maxdepth 7 -type f -name '*.ph*' -print0 | \
+    xargs -0 -r grep -lE '(system|shell_exec|passthru|popen|proc_open|pcntl_exec|assert)[[:space:]]*\(' 2>/dev/null | \
+    tr '\n' '\0' | xargs -0 -r grep -lE '\$_(POST|GET|REQUEST|COOKIE)' 2>/dev/null | head -25)
+  if [ -n "$_w2" ]; then printf '%s\n' "$_w2" | sed 's/^/      /'; flag "File vừa có hàm thực thi lệnh vừa đọc input người dùng"; else echo "      (không khớp)"; fi
+fi
 echo "  [3] File có entropy cao bất thường (mã hoá/nén — dấu hiệu obfuscation):"
 ffind /var/www /srv -maxdepth 7 -type f -name '*.ph*' -size +2k -print 2>/dev/null | head -3000 | \
   while read -r f; do
@@ -714,7 +811,7 @@ ffind /var/www /srv -maxdepth 2 -type f -name '*.ph*' -newer /etc/hostname -prin
 
 sub "T3-06 File web sửa gần đây (đối chiếu với lịch deploy của team)"
 ffind /var/www /srv /home -maxdepth 7 -type f \( -name '*.php' -o -name '*.js' -o -name '.htaccess' \) \
-  -mtime -14 -printf '%TY-%Tm-%Td %TH:%TM %p\n' -print 2>/dev/null | sort -r | head -40 | sed 's/^/  /' || ok "không có file web nào sửa trong 14 ngày"
+  -mtime -14 -printf '%TY-%Tm-%Td %TH:%TM %p\n'  2>/dev/null | sort -r | head -40 | emit ok "không có file web nào sửa trong 14 ngày" '  '
 note "Deploy hợp lệ sẽ tạo ra nhiều dòng ở đây. Cái cần tìm là file lẻ sửa NGOÀI đợt deploy."
 
 sub "T3-06 WordPress — ĐỌC THUẦN TỪ DISK, KHÔNG chạy wp-cli"
@@ -746,7 +843,8 @@ note "Trạng thái active/inactive nằm trong DB — cố ý không truy vấn
 note "Đối chiếu version với wpscan.com/wordpresses và wordpress.org/plugins/<tên>/"
 
 sub "T3-07 TLS"
-ffind /etc/letsencrypt/live /etc/ssl/certs /etc/pki/tls/certs /etc/nginx -maxdepth 4 -name 'fullchain.pem' -o -name 'cert.pem' -o -name '*.crt' -print 2>/dev/null | head -10 | \
+ffind /etc/letsencrypt/live /etc/ssl/certs /etc/pki/tls/certs /etc/nginx -maxdepth 4 \
+  \( -name 'fullchain.pem' -o -name 'cert.pem' -o -name '*.crt' \) -print | head -10 | \
   while read -r c; do
     _s=$(openssl x509 -in "$c" -noout -subject -enddate 2>/dev/null)
     [ -n "$_s" ] && { echo "  == $c"; printf '%s\n' "$_s" | sed 's/^/     /'; }
@@ -759,7 +857,7 @@ systemctl is-active certbot.timer snap.certbot.renew.timer 2>/dev/null | sed 's/
 sub "T3-08 EMAIL — open relay và hàng đợi (v1 bỏ sót hoàn toàn)"
 note "Mail server bị lạm dụng = IP vào blacklist = email của toàn bộ client rơi vào spam."
 note "Với agency, đây là thiệt hại kinh doanh trực tiếp."
-ss -tlnp 2>/dev/null | grep -E ':(25|465|587|110|143|993|995)[[:space:]]' | sed 's/^/  /' || ok "không có dịch vụ mail nào lắng nghe"
+ss -tlnp 2>/dev/null | grep -E ':(25|465|587|110|143|993|995)[[:space:]]' | emit ok "không có dịch vụ mail nào lắng nghe" '  '
 if has postconf; then
   postconf -n 2>/dev/null | grep -E '^(mynetworks|smtpd_relay_restrictions|smtpd_recipient_restrictions|inet_interfaces|relayhost|smtpd_sasl_auth_enable)' | sed 's/^/  /'
   postconf -n 2>/dev/null | grep -qE '^mynetworks.*0\.0\.0\.0/0' && flag "mynetworks chứa 0.0.0.0/0 — OPEN RELAY"
@@ -777,7 +875,7 @@ note "Kiểm tra IP có bị blacklist: https://mxtoolbox.com/blacklists.aspx"
 sec "TIER 5 — LEO THANG ĐẶC QUYỀN VÀ CONTAINER"
 
 sub "T5-01 Cấu hình sudo"
-grep -hvE '^[[:space:]]*(#|$)' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | redact | sed 's/^/  /' || unknown "không đọc được sudoers (cần root)"
+grep -hvE '^[[:space:]]*(#|$)' /etc/sudoers /etc/sudoers.d/* 2>/dev/null | redact | emit unknown "không đọc được sudoers (cần root)" '  '
 sudo --version 2>/dev/null | head -1 | sed 's/^/  /'
 _np=$(grep -rhE 'NOPASSWD' /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -vE '^[[:space:]]*#')
 if [ -n "$_np" ]; then printf '%s\n' "$_np" | sed 's/^/  /'; flag "Có quy tắc NOPASSWD"
@@ -791,6 +889,9 @@ sub "T5-02 SUID/SGID — so khớp theo ĐƯỜNG DẪN ĐẦY ĐỦ (v1 chỉ s
 _suid=$(ffind / -xdev -type f -perm -4000 -print 2>/dev/null)
 _cnt=$(printf '%s\n' "$_suid" | grep -c .)
 echo "  tổng số binary SUID tìm thấy: $_cnt"
+if [ "$_cnt" -eq 0 ]; then
+  unknown "không liệt kê được SUID nào — trên Linux thật luôn có ít nhất vài cái (su, sudo, passwd...). Con số 0 nghĩa là QUÉT HỎNG, không phải máy sạch."
+fi
 printf '%s\n' "$_suid" | grep -vxF -f <(cat <<'WL'
 /usr/bin/su
 /usr/bin/sudo
@@ -832,11 +933,11 @@ printf '%s\n' "$_suid" | grep -vxF -f <(cat <<'WL'
 /usr/bin/pmount
 /usr/bin/pumount
 WL
-) 2>/dev/null | sed 's/^/  NGOÀI DANH SÁCH CHUẨN: /' || ok "mọi SUID đều nằm trong danh sách chuẩn"
+) 2>/dev/null | emit ok "mọi SUID đều nằm trong danh sách chuẩn" '  NGOÀI DANH SÁCH CHUẨN: '
 note "SUID ở /tmp /home /var/tmp, hoặc trên bash/python/perl/find/vim/nmap/cp/tar = leo root ngay."
 
 sub "T5-02 SGID"
-ffind / -xdev -type f -perm -2000 -print 2>/dev/null | head -30 | sed 's/^/  /' || ok "không có SGID"
+ffind / -xdev -type f -perm -2000 -print 2>/dev/null | head -30 | emit ok "không có SGID" '  '
 
 sub "T5-02 File capabilities (SUID 'ẩn', rất hay bị bỏ sót)"
 if has getcap; then
@@ -845,8 +946,8 @@ if has getcap; then
 else unknown "getcap chưa cài — KHÔNG kiểm tra được lớp này"; fi
 
 sub "T5-02 File/thư mục ai cũng ghi được"
-ffind / -xdev -type f -perm -0002 ! -type l -print 2>/dev/null | head -20 | sed 's/^/  file: /' || ok "không có file world-writable"
-ffind / -xdev -type d -perm -0002 ! -perm -1000 -print 2>/dev/null | head -15 | sed 's/^/  thư mục không sticky: /' || ok "không có thư mục world-writable thiếu sticky bit"
+ffind / -xdev -type f -perm -0002 ! -type l -print 2>/dev/null | head -20 | emit ok "không có file world-writable" '  file: '
+ffind / -xdev -type d -perm -0002 ! -perm -1000 -print 2>/dev/null | head -15 | emit ok "không có thư mục world-writable thiếu sticky bit" '  thư mục không sticky: '
 echo "  --- file/thư mục ghi được nằm trong PATH (đường chiếm quyền qua binary giả):"
 printf '%s' "$PATH" | tr ':' '\n' | while read -r d; do
   [ -d "$d" ] || continue
@@ -892,8 +993,8 @@ else unknown "docker chưa cài"; fi
 if has podman; then podman ps -a 2>/dev/null | head -10 | sed 's/^/  podman: /'; fi
 
 sub "T5-05 SELinux / AppArmor / systemd hardening"
-sestatus 2>/dev/null | head -6 | sed 's/^/  /' || getenforce 2>/dev/null | sed 's/^/  SELinux: /' || unknown "SELinux không có"
-aa-status 2>/dev/null | head -5 | sed 's/^/  /' || unknown "AppArmor không có"
+sestatus 2>/dev/null | head -6 | sed 's/^/  /' || getenforce 2>/dev/null | emit unknown "SELinux không có" '  SELinux: '
+aa-status 2>/dev/null | head -5 | emit unknown "AppArmor không có" '  '
 echo "  --- service chạy quyền root:"
 ps -eo user,comm --no-headers 2>/dev/null | awk '$1=="root"{print $2}' | sort -u | tr '\n' ' ' | fold -w 100 | sed 's/^/    /'
 echo
@@ -1002,15 +1103,14 @@ else
   unknown "needrestart / needs-restarting chưa cài — dùng cách thủ công bên dưới"
 fi
 echo "  --- tiến trình còn map thư viện ĐÃ BỊ XOÁ (tức là bản cũ, chưa restart):"
-_stale=0
-for p in /proc/[0-9]*; do
-  if grep -qE '/(usr|lib)/.*\(deleted\)' "$p/maps" 2>/dev/null; then
-    echo "      PID ${p#/proc/}  $(cat "$p/comm" 2>/dev/null)"
-    _stale=1
-  fi
-done 2>/dev/null | sort -u -k3 | head -25
-[ "$_stale" = 0 ] && ok "không tiến trình nào dùng thư viện cũ đã bị thay" || \
+_stale=$( for p in /proc/[0-9]*; do
+    grep -qE '/(usr|lib)/.*\(deleted\)' "$p/maps" 2>/dev/null && \
+      echo "      PID ${p#/proc/}  $(cat "$p/comm" 2>/dev/null)"
+  done 2>/dev/null | sort -u -k3 | head -25 )
+if [ -n "$_stale" ]; then
+  printf '%s\n' "$_stale"
   flag "Có tiến trình chạy thư viện cũ — bản vá CHƯA có hiệu lực với chúng"
+else ok "không tiến trình nào dùng thư viện cũ đã bị thay"; fi
 [ -f /var/run/reboot-required ] && flag "/var/run/reboot-required tồn tại — cần reboot"
 
 sub "T7-10 Phần mềm KHÔNG cài qua package manager (mọi tracker đều mù với nhóm này)"
@@ -1027,20 +1127,23 @@ sec "TIER 6 — SUPPLY CHAIN VÀ CI/CD"
 sub "T6-01 Lockfile của ứng dụng"
 ffind /var/www /srv /opt /home -maxdepth 5 -type f \
   \( -name 'package-lock.json' -o -name 'yarn.lock' -o -name 'pnpm-lock.yaml' -o -name 'composer.lock' -o -name 'poetry.lock' -o -name 'Gemfile.lock' \) \
-  -printf '%TY-%Tm-%Td %p\n' -print 2>/dev/null | sort -r | head -20 | sed 's/^/  /' || unknown "không tìm thấy lockfile"
+  -printf '%TY-%Tm-%Td %p\n'  2>/dev/null | sort -r | head -20 | emit unknown "không tìm thấy lockfile" '  '
 
 sub "T6-01 Script preinstall/postinstall trong dependency (vector chèn mã hàng đầu)"
-_hook=$(ffind /var/www /srv /opt -maxdepth 6 -path '*/node_modules/*' -name 'package.json' -print 2>/dev/null | \
-  head -4000 | xargs -r grep -lE '"(pre|post)?install"[[:space:]]*:' 2>/dev/null | head -25)
+_hook=$(ffind /var/www /srv /opt -maxdepth 6 -path '*/node_modules/*' -name 'package.json' -print0 | \
+  xargs -0 -r grep -lE '"(pre|post)?install"[[:space:]]*:' 2>/dev/null | head -25)
 if [ -n "$_hook" ]; then printf '%s\n' "$_hook" | sed 's/^/  /'
   note "npm worm 2025-2026 (Shai-Hulud, ChainDrop) chạy từ hook preinstall — TRƯỚC khi cài xong."
   note "Chúng nhắm đúng vào npm token, GitHub PAT, AWS credential, SSH key trên máy."
 else ok "không tìm thấy install hook trong node_modules đã quét"; fi
 
 sub "T6-02 File chứa TOKEN CI/CD và cloud key (CHỈ in tên file)"
-ffind /root /home /var/www /opt /etc /srv -maxdepth 6 -type f -size -2M -print 2>/dev/null | head -10000 | \
-  xargs -r grep -lI -E 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{15,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}' 2>/dev/null | \
-  head -25 | while read -r f; do stat -c '  %a %U:%G  %n' "$f" 2>/dev/null; done || ok "không tìm thấy token"
+_tok=$(ffind /root /home /var/www /opt /etc /srv -maxdepth 6 -type f -size -2M -print0 | \
+  xargs -0 -r grep -lI -E 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{15,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}' 2>/dev/null | head -25)
+if [ -n "$_tok" ]; then
+  printf '%s\n' "$_tok" | while IFS= read -r f; do stat -c '  %a %U:%G  %n' "$f" 2>/dev/null; done
+  flag "Có file chứa token CI/CD hoặc cloud key"
+else ok "không tìm thấy token"; fi
 echo "  --- file credential cloud/CI đã biết:"
 for f in /root/.aws/credentials /root/.docker/config.json /root/.npmrc /root/.config/gh/hosts.yml \
          /root/.kube/config /home/*/.aws/credentials /home/*/.npmrc /home/*/.docker/config.json; do
@@ -1048,7 +1151,7 @@ for f in /root/.aws/credentials /root/.docker/config.json /root/.npmrc /root/.co
 done
 
 sub "T6-02 CI runner chạy trên VPS"
-ps aux 2>/dev/null | grep -iE 'gitlab-runner|actions-runner|Runner.Listener|jenkins|drone-runner|buildkite' | grep -v grep | redact | sed 's/^/  /' || ok "không có CI runner"
+ps aux 2>/dev/null | grep -iE 'gitlab-runner|actions-runner|Runner.Listener|jenkins|drone-runner|buildkite' | grep -v grep | redact | emit ok "không có CI runner" '  '
 ls -la /etc/gitlab-runner/ /home/*/actions-runner/ 2>/dev/null | head -10 | sed 's/^/  /' || true
 note "CI runner chạy quyền root trên production = chiếm repo là chiếm server."
 
@@ -1084,7 +1187,7 @@ _st=$(grep -hE '^Storage=' /etc/systemd/journald.conf 2>/dev/null)
 printf '%s' "$_st" | grep -q 'volatile' && flag "journald Storage=volatile — log MẤT SẠCH sau mỗi lần reboot"
 
 sub "T9-01 Log có được gửi RA NGOÀI máy không"
-_rem=$(grep -rhE '^[^#]*(@@?[a-zA-Z0-9.]|target=|action\(type="omfwd")' /etc/rsyslog.conf /etc/rsyslog.d/ 2>/dev/null)
+_rem=$(grep -rhE '^[^#]*(@@?[a-zA-Z0-9.]|target=|action\(type="omfwd")' /etc/rsyslog.conf /etc/rsyslog.d/ 2>/dev/null | redact)
 if [ -n "$_rem" ]; then printf '%s\n' "$_rem" | sed 's/^/  /'; ok "có cấu hình gửi log ra ngoài"
 else flag "KHÔNG có log tập trung — attacker có root xoá log là mất sạch bằng chứng"; fi
 for a in filebeat vector promtail fluent-bit fluentd wazuh-agent datadog-agent; do
@@ -1123,8 +1226,8 @@ fi
 has canonical-livepatch && timeout 30 canonical-livepatch status 2>/dev/null | head -6 | sed 's/^/  /' || true
 
 sub "T9-05 Tài nguyên — cạn kiệt cũng là sự cố bảo mật"
-df -hT 2>/dev/null | awk 'NR==1 || ($6+0)>85 {print "  "$0}' | head -10
-_inode=$(df -i 2>/dev/null | awk '($5+0)>85 {print "  INODE sắp cạn: "$0}')
+timeout 20 df -hT 2>/dev/null | awk 'NR==1 || ($6+0)>85 {print "  "$0}' | head -10
+_inode=$(timeout 20 df -i 2>/dev/null | awk '($5+0)>85 {print "  INODE sắp cạn: "$0}')
 [ -n "$_inode" ] && printf '%s\n' "$_inode"
 note "Disk đầy = log ngừng ghi, backup fail, DB corrupt. Cũng là hệ quả thường thấy của miner/log flood."
 
@@ -1142,7 +1245,7 @@ else
 fi
 
 sub "Bề mặt AI/LLM (nếu có)"
-ps aux 2>/dev/null | grep -iE 'ollama|vllm|mcp-|model-context|localai|text-generation' | grep -v grep | redact | sed 's/^/  /' || ok "không có dịch vụ LLM"
+ps aux 2>/dev/null | grep -iE 'ollama|vllm|mcp-|model-context|localai|text-generation' | grep -v grep | redact | emit ok "không có dịch vụ LLM" '  '
 ss -tlnp 2>/dev/null | grep -E ':(11434|8000|5000|7860)[[:space:]]' | sed 's/^/  /' || true
 
 hr
